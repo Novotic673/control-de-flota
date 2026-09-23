@@ -1,0 +1,741 @@
+// ============================================================================
+// NOVOTIC FLEET — Modelo de datos (PostgreSQL + Prisma)
+// ----------------------------------------------------------------------------
+// Convenciones:
+//  * Tablas en snake_case (@@map) y columnas en snake_case (@map).
+//  * Montos en CLP como enteros (Int): el peso chileno no usa decimales.
+//  * Kilometraje en km enteros.
+//  * Soft delete (deleted_at) en entidades con valor histórico.
+//  * Archivos: tabla única `stored_files`; los binarios viven en S3 (o disco
+//    local en desarrollo) y nunca se exponen por URL pública permanente.
+//  * Restricciones que Prisma no expresa (exclusión de reservas superpuestas,
+//    CHECKs, índices parciales) se agregan en la migración SQL inicial.
+// ============================================================================
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// La URL de conexión se define en prisma.config.ts (Prisma 7).
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum VehicleStatus {
+  AVAILABLE      // DISPONIBLE
+  RESERVED       // RESERVADO (derivado en tiempo real; ver lib/domain/vehicle-status.ts)
+  IN_USE         // EN USO
+  MAINTENANCE    // EN MANTENCIÓN
+  OUT_OF_SERVICE // FUERA DE SERVICIO
+}
+
+enum VehicleType {
+  SEDAN
+  HATCHBACK
+  SUV
+  PICKUP
+  VAN
+  MINIBUS
+  TRUCK
+  OTHER
+}
+
+enum FuelType {
+  GASOLINE
+  DIESEL
+  HYBRID
+  ELECTRIC
+  GAS
+}
+
+enum ReservationStatus {
+  PENDING     // PENDIENTE
+  CONFIRMED   // CONFIRMADA
+  IN_PROGRESS // EN CURSO
+  COMPLETED   // FINALIZADA
+  CANCELLED   // CANCELADA
+  REJECTED    // RECHAZADA (por administrador)
+}
+
+enum OdometerSource {
+  INITIAL
+  CHECKOUT
+  CHECKIN
+  MAINTENANCE
+  INCIDENT
+  MANUAL_ADJUSTMENT
+}
+
+enum MaintenanceMode {
+  KM
+  DATE
+  KM_AND_DATE
+}
+
+enum IncidentCategory {
+  EXTERIOR_DAMAGE
+  INTERIOR_DAMAGE
+  TIRES
+  ENGINE
+  LIGHTS
+  BRAKES
+  ACCIDENT
+  CLEANING
+  DOCUMENTATION
+  OTHER
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+enum ExpenseCategory {
+  FUEL
+  MAINTENANCE
+  REPAIR
+  TOLL
+  PARKING
+  INSURANCE
+  PERMIT
+  FINE
+  OTHER
+}
+
+enum NotificationSeverity {
+  INFO
+  WARNING
+  IMPORTANT
+  CRITICAL
+}
+
+enum NotificationType {
+  MAINTENANCE_UPCOMING
+  MAINTENANCE_OVERDUE
+  DOCUMENT_EXPIRING
+  DOCUMENT_EXPIRED
+  RESERVATION_REMINDER
+  RESERVATION_STARTED
+  RESERVATION_NOT_PICKED_UP
+  VEHICLE_NOT_RETURNED
+  RESERVATION_APPROVED
+  RESERVATION_REJECTED
+  INCIDENT_REPORTED
+  VEHICLE_BLOCKED
+  SYSTEM
+}
+
+enum AuditAction {
+  LOGIN
+  LOGIN_FAILED
+  LOGOUT
+  CREATE
+  UPDATE
+  DELETE
+  DOCUMENT_DOWNLOAD
+  RESERVE
+  CANCEL_RESERVATION
+  APPROVE_RESERVATION
+  REJECT_RESERVATION
+  CHECKOUT
+  CHECKIN
+  ODOMETER_CHANGE
+  BLOCK_VEHICLE
+  UNBLOCK_VEHICLE
+  PASSWORD_CHANGE
+}
+
+enum FileScope {
+  VEHICLE_PHOTO
+  VEHICLE_DOCUMENT
+  ODOMETER_PHOTO
+  USAGE_PHOTO
+  INCIDENT_PHOTO
+  MAINTENANCE
+  EXPENSE
+}
+
+// ---------------------------------------------------------------------------
+// Usuarios, roles y permisos (RBAC)
+// ---------------------------------------------------------------------------
+
+model Department {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users    User[]
+  vehicles Vehicle[]
+
+  @@map("departments")
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  name           String
+  passwordHash   String    @map("password_hash")
+  phone          String?
+  rut            String?   @unique
+  licenseNumber  String?   @map("license_number")
+  licenseClass   String?   @map("license_class")
+  licenseExpiry  DateTime? @map("license_expiry") @db.Date
+  departmentId   String?   @map("department_id")
+  active         Boolean   @default(true)
+  lastLoginAt    DateTime? @map("last_login_at")
+  failedLogins   Int       @default(0) @map("failed_logins")
+  lockedUntil    DateTime? @map("locked_until")
+  deletedAt      DateTime? @map("deleted_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  roles      UserRole[]
+
+  reservations         Reservation[]      @relation("ReservationDriver")
+  reservationsCreated  Reservation[]      @relation("ReservationCreator")
+  reservationsApproved Reservation[]      @relation("ReservationApprover")
+  usages               VehicleUsage[]
+  odometerRecords      OdometerRecord[]
+  maintenanceRecords   MaintenanceRecord[]
+  incidentsReported    Incident[]         @relation("IncidentReporter")
+  incidentsResolved    Incident[]         @relation("IncidentResolver")
+  expenses             Expense[]
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  uploadedFiles        StoredFile[]
+  documentsUploaded    VehicleDocument[]
+
+  @@index([departmentId])
+  @@index([active, deletedAt])
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  key         String   @unique // ADMIN, DRIVER, SUPERVISOR, MAINTENANCE, FINANCE, MANAGEMENT
+  name        String
+  description String?
+  permissions String[] // ver lib/auth/permissions.ts
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  userId     String   @map("user_id")
+  roleId     String   @map("role_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// ---------------------------------------------------------------------------
+// Archivos (S3-compatible)
+// ---------------------------------------------------------------------------
+
+model StoredFile {
+  id           String    @id @default(cuid())
+  storageKey   String    @unique @map("storage_key")
+  scope        FileScope
+  mimeType     String    @map("mime_type")
+  sizeBytes    Int       @map("size_bytes")
+  originalName String    @map("original_name")
+  sha256       String?
+  vehicleId    String?   @map("vehicle_id") // dueño lógico (control de acceso)
+  uploadedById String?   @map("uploaded_by_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  vehicle    Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  uploadedBy User?    @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  vehiclePhoto           VehiclePhoto?
+  vehicleDocument        VehicleDocument?
+  odometerRecords        OdometerRecord[]
+  usagePhotos            UsagePhoto[]
+  incidentPhotos         IncidentPhoto[]
+  maintenanceAttachments MaintenanceAttachment[]
+  expenses               Expense[]
+  blob                   FileBlob?
+
+  @@index([vehicleId, scope])
+  @@map("stored_files")
+}
+
+/// Contenido binario cuando STORAGE_DRIVER=database (arranque rápido sin S3).
+model FileBlob {
+  fileId String @id @map("file_id")
+  data   Bytes
+
+  file StoredFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@map("file_blobs")
+}
+
+// ---------------------------------------------------------------------------
+// Vehículos
+// ---------------------------------------------------------------------------
+
+model Vehicle {
+  id                String        @id @default(cuid())
+  internalCode      String        @unique @map("internal_code") // ID interno (NVT-001)
+  plate             String        @unique // patente normalizada: ABCD12
+  brand             String
+  model             String
+  year              Int
+  color             String?
+  type              VehicleType
+  vin               String?       @unique
+  engineNumber      String?       @map("engine_number")
+  fuelType          FuelType      @map("fuel_type")
+  passengerCapacity Int           @map("passenger_capacity")
+  currentOdometer   Int           @default(0) @map("current_odometer")
+  status            VehicleStatus @default(AVAILABLE)
+  blocked           Boolean       @default(false)
+  blockedReason     String?       @map("blocked_reason")
+  blockedAt         DateTime?     @map("blocked_at")
+  requiresApproval  Boolean       @default(false) @map("requires_approval") // reservas quedan PENDIENTE
+  qrToken           String        @unique @map("qr_token") // token opaco para el QR
+  departmentId      String?       @map("department_id")
+  notes             String?
+  deletedAt         DateTime?     @map("deleted_at")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  department         Department?         @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  photos             VehiclePhoto[]
+  documents          VehicleDocument[]
+  reservations       Reservation[]
+  usages             VehicleUsage[]
+  odometerRecords    OdometerRecord[]
+  maintenancePlans   MaintenancePlan[]
+  maintenanceRecords MaintenanceRecord[]
+  incidents          Incident[]
+  expenses           Expense[]
+  notifications      Notification[]
+  files              StoredFile[]
+
+  @@index([status])
+  @@index([deletedAt])
+  @@index([brand, model])
+  @@map("vehicles")
+}
+
+model VehiclePhoto {
+  id        String   @id @default(cuid())
+  vehicleId String   @map("vehicle_id")
+  fileId    String   @unique @map("file_id")
+  caption   String?
+  isMain    Boolean  @default(false) @map("is_main")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  vehicle Vehicle    @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  file    StoredFile @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([vehicleId])
+  @@map("vehicle_photos")
+}
+
+// ---------------------------------------------------------------------------
+// Documentos (billetera digital)
+// ---------------------------------------------------------------------------
+
+model DocumentType {
+  id                    String   @id @default(cuid())
+  key                   String   @unique // PERMISO_CIRCULACION, SOAP, REVISION_TECNICA, PADRON ...
+  name                  String
+  requiredForInspection Boolean  @default(false) @map("required_for_inspection") // Modo fiscalización
+  hasExpiry             Boolean  @default(true) @map("has_expiry")
+  sortOrder             Int      @default(0) @map("sort_order")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  documents VehicleDocument[]
+
+  @@map("document_types")
+}
+
+model VehicleDocument {
+  id             String    @id @default(cuid())
+  vehicleId      String    @map("vehicle_id")
+  documentTypeId String    @map("document_type_id")
+  fileId         String    @unique @map("file_id")
+  name           String
+  issueDate      DateTime? @map("issue_date") @db.Date
+  expiryDate     DateTime? @map("expiry_date") @db.Date
+  notes          String?
+  uploadedById   String?   @map("uploaded_by_id")
+  deletedAt      DateTime? @map("deleted_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  vehicle      Vehicle      @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  documentType DocumentType @relation(fields: [documentTypeId], references: [id], onDelete: Restrict)
+  file         StoredFile   @relation(fields: [fileId], references: [id], onDelete: Restrict)
+  uploadedBy   User?        @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([vehicleId, deletedAt])
+  @@index([expiryDate])
+  @@index([documentTypeId])
+  @@map("vehicle_documents")
+}
+
+// ---------------------------------------------------------------------------
+// Reservas y uso
+// ---------------------------------------------------------------------------
+
+model Reservation {
+  id           String            @id @default(cuid())
+  vehicleId    String            @map("vehicle_id")
+  driverId     String            @map("driver_id")
+  createdById  String            @map("created_by_id")
+  startAt      DateTime          @map("start_at")
+  endAt        DateTime          @map("end_at")
+  destination  String
+  purpose      String
+  notes        String?
+  status       ReservationStatus @default(CONFIRMED)
+  approvedById String?           @map("approved_by_id")
+  approvedAt   DateTime?         @map("approved_at")
+  cancelledAt  DateTime?         @map("cancelled_at")
+  cancelReason String?           @map("cancel_reason")
+  reminderSentAt DateTime?       @map("reminder_sent_at")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  vehicle    Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  driver     User          @relation("ReservationDriver", fields: [driverId], references: [id], onDelete: Restrict)
+  createdBy  User          @relation("ReservationCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  approvedBy User?         @relation("ReservationApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  usage      VehicleUsage?
+
+  @@index([vehicleId, startAt, endAt])
+  @@index([driverId, startAt])
+  @@index([status, startAt])
+  @@map("reservations")
+}
+
+/// Un viaje: desde el retiro (check-out) hasta la devolución (check-in).
+model VehicleUsage {
+  id                String    @id @default(cuid())
+  vehicleId         String    @map("vehicle_id")
+  driverId          String    @map("driver_id")
+  reservationId     String?   @unique @map("reservation_id")
+  destination       String
+  purpose           String
+  checkoutAt        DateTime  @default(now()) @map("checkout_at")
+  startOdometer     Int       @map("start_odometer")
+  fuelLevelOut      Int       @map("fuel_level_out") // 0-100 %
+  exteriorOut       String    @map("exterior_out")
+  interiorOut       String    @map("interior_out")
+  checklistOut      Json      @map("checklist_out")
+  notesOut          String?   @map("notes_out")
+  checkinAt         DateTime? @map("checkin_at")
+  endOdometer       Int?      @map("end_odometer")
+  distanceKm        Int?      @map("distance_km")
+  fuelLevelIn       Int?      @map("fuel_level_in")
+  conditionIn       String?   @map("condition_in")
+  newDamage         Boolean?  @map("new_damage")
+  notesIn           String?   @map("notes_in")
+  adminOverride     Boolean   @default(false) @map("admin_override") // retiro sin reserva
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  vehicle         Vehicle          @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  driver          User             @relation(fields: [driverId], references: [id], onDelete: Restrict)
+  reservation     Reservation?     @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  odometerRecords OdometerRecord[]
+  photos          UsagePhoto[]
+  incidents       Incident[]
+
+  @@index([vehicleId, checkoutAt])
+  @@index([driverId, checkoutAt])
+  @@index([checkinAt])
+  @@map("vehicle_usage")
+}
+
+model UsagePhoto {
+  id        String   @id @default(cuid())
+  usageId   String   @map("usage_id")
+  fileId    String   @map("file_id")
+  stage     String   // CHECKOUT | CHECKIN
+  createdAt DateTime @default(now()) @map("created_at")
+
+  usage VehicleUsage @relation(fields: [usageId], references: [id], onDelete: Cascade)
+  file  StoredFile   @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([usageId])
+  @@map("usage_photos")
+}
+
+model OdometerRecord {
+  id            String         @id @default(cuid())
+  vehicleId     String         @map("vehicle_id")
+  value         Int
+  previousValue Int?           @map("previous_value")
+  source        OdometerSource
+  usageId       String?        @map("usage_id")
+  photoFileId   String?        @map("photo_file_id")
+  reason        String?
+  flaggedAbnormal Boolean      @default(false) @map("flagged_abnormal")
+  recordedById  String         @map("recorded_by_id")
+  recordedAt    DateTime       @default(now()) @map("recorded_at")
+
+  vehicle    Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  usage      VehicleUsage? @relation(fields: [usageId], references: [id], onDelete: SetNull)
+  photo      StoredFile?   @relation(fields: [photoFileId], references: [id], onDelete: SetNull)
+  recordedBy User          @relation(fields: [recordedById], references: [id], onDelete: Restrict)
+
+  @@index([vehicleId, recordedAt])
+  @@map("odometer_records")
+}
+
+// ---------------------------------------------------------------------------
+// Mantenciones
+// ---------------------------------------------------------------------------
+
+model MaintenanceType {
+  id                    String   @id @default(cuid())
+  key                   String   @unique
+  name                  String
+  description           String?
+  defaultIntervalKm     Int?     @map("default_interval_km")
+  defaultIntervalMonths Int?     @map("default_interval_months")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  plans   MaintenancePlan[]
+  records MaintenanceRecord[]
+
+  @@map("maintenance_types")
+}
+
+/// Configuración de mantención programada por vehículo.
+model MaintenancePlan {
+  id                String          @id @default(cuid())
+  vehicleId         String          @map("vehicle_id")
+  maintenanceTypeId String          @map("maintenance_type_id")
+  mode              MaintenanceMode
+  intervalKm        Int?            @map("interval_km")
+  intervalMonths    Int?            @map("interval_months")
+  nextDueKm         Int?            @map("next_due_km")
+  nextDueDate       DateTime?       @map("next_due_date") @db.Date
+  lastDoneKm        Int?            @map("last_done_km")
+  lastDoneDate      DateTime?       @map("last_done_date") @db.Date
+  blockWhenOverdue  Boolean         @default(true) @map("block_when_overdue") // no reservable si vencida
+  active            Boolean         @default(true)
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+
+  vehicle         Vehicle             @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  maintenanceType MaintenanceType     @relation(fields: [maintenanceTypeId], references: [id], onDelete: Restrict)
+  records         MaintenanceRecord[]
+
+  @@unique([vehicleId, maintenanceTypeId])
+  @@index([nextDueKm])
+  @@index([nextDueDate])
+  @@map("maintenance_plans")
+}
+
+model MaintenanceRecord {
+  id                String    @id @default(cuid())
+  vehicleId         String    @map("vehicle_id")
+  maintenanceTypeId String    @map("maintenance_type_id")
+  planId            String?   @map("plan_id")
+  performedAt       DateTime  @map("performed_at") @db.Date
+  odometer          Int
+  workshop          String?
+  provider          String?
+  description       String?
+  workPerformed     String?   @map("work_performed")
+  parts             String?
+  cost              Int       @default(0) // CLP
+  invoiceNumber     String?   @map("invoice_number")
+  workOrderNumber   String?   @map("work_order_number")
+  nextDueKm         Int?      @map("next_due_km")
+  nextDueDate       DateTime? @map("next_due_date") @db.Date
+  createdById       String    @map("created_by_id")
+  deletedAt         DateTime? @map("deleted_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  vehicle         Vehicle                 @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  maintenanceType MaintenanceType         @relation(fields: [maintenanceTypeId], references: [id], onDelete: Restrict)
+  plan            MaintenancePlan?        @relation(fields: [planId], references: [id], onDelete: SetNull)
+  createdBy       User                    @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  attachments     MaintenanceAttachment[]
+  expense         Expense?
+
+  @@index([vehicleId, performedAt])
+  @@map("maintenance_records")
+}
+
+model MaintenanceAttachment {
+  id        String   @id @default(cuid())
+  recordId  String   @map("record_id")
+  fileId    String   @map("file_id")
+  kind      String   // PHOTO | INVOICE | WORK_ORDER
+  createdAt DateTime @default(now()) @map("created_at")
+
+  record MaintenanceRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  file   StoredFile        @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([recordId])
+  @@map("maintenance_attachments")
+}
+
+// ---------------------------------------------------------------------------
+// Incidencias
+// ---------------------------------------------------------------------------
+
+model Incident {
+  id              String           @id @default(cuid())
+  vehicleId       String           @map("vehicle_id")
+  reportedById    String           @map("reported_by_id")
+  usageId         String?          @map("usage_id")
+  category        IncidentCategory
+  severity        IncidentSeverity
+  description     String
+  odometer        Int?
+  status          IncidentStatus   @default(OPEN)
+  blockedVehicle  Boolean          @default(false) @map("blocked_vehicle")
+  resolvedById    String?          @map("resolved_by_id")
+  resolvedAt      DateTime?        @map("resolved_at")
+  resolutionNotes String?          @map("resolution_notes")
+  deletedAt       DateTime?        @map("deleted_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  vehicle    Vehicle         @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  reportedBy User            @relation("IncidentReporter", fields: [reportedById], references: [id], onDelete: Restrict)
+  resolvedBy User?           @relation("IncidentResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  usage      VehicleUsage?   @relation(fields: [usageId], references: [id], onDelete: SetNull)
+  photos     IncidentPhoto[]
+
+  @@index([vehicleId, status])
+  @@index([severity, status])
+  @@index([createdAt])
+  @@map("incidents")
+}
+
+model IncidentPhoto {
+  id         String   @id @default(cuid())
+  incidentId String   @map("incident_id")
+  fileId     String   @map("file_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  incident Incident   @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  file     StoredFile @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([incidentId])
+  @@map("incident_photos")
+}
+
+// ---------------------------------------------------------------------------
+// Costos
+// ---------------------------------------------------------------------------
+
+model Expense {
+  id                  String          @id @default(cuid())
+  vehicleId           String          @map("vehicle_id")
+  category            ExpenseCategory
+  date                DateTime        @db.Date
+  provider            String?
+  amount              Int // CLP
+  documentNumber      String?         @map("document_number")
+  receiptFileId       String?         @map("receipt_file_id")
+  maintenanceRecordId String?         @unique @map("maintenance_record_id")
+  userId              String          @map("user_id")
+  notes               String?
+  deletedAt           DateTime?       @map("deleted_at")
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
+
+  vehicle           Vehicle            @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  receipt           StoredFile?        @relation(fields: [receiptFileId], references: [id], onDelete: SetNull)
+  maintenanceRecord MaintenanceRecord? @relation(fields: [maintenanceRecordId], references: [id], onDelete: SetNull)
+  user              User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([vehicleId, date])
+  @@index([category, date])
+  @@map("expenses")
+}
+
+// ---------------------------------------------------------------------------
+// Notificaciones, configuración y auditoría
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String               @id @default(cuid())
+  userId    String               @map("user_id")
+  type      NotificationType
+  severity  NotificationSeverity @default(INFO)
+  title     String
+  body      String
+  link      String?
+  vehicleId String?              @map("vehicle_id")
+  dedupeKey String               @map("dedupe_key") // evita duplicar la misma alerta
+  readAt    DateTime?            @map("read_at")
+  createdAt DateTime             @default(now()) @map("created_at")
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicle Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  userId    String?     @map("user_id")
+  action    AuditAction
+  entity    String?
+  entityId  String?     @map("entity_id")
+  summary   String?
+  metadata  Json?
+  ip        String?
+  userAgent String?     @map("user_agent")
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
